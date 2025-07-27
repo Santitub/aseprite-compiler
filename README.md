@@ -10,14 +10,14 @@
 
 Este proyecto proporciona un contenedor Docker preconfigurado para **compilar Aseprite** (un popular editor de pixel art) desde su [repositorio oficial](https://github.com/aseprite/aseprite). La idea es simplificar el proceso de compilación, evitando conflictos de dependencias o instalaciones manuales.
 
-> ⚠️ **Importante**: Este proyecto **no distribuye Aseprite compilado**. El binario generado está sujeto a la licencia EULA de Aseprite y solo puede ser usado personalmente. **Redistribuirlo está prohibido**.
+> ⚠️ **Importante:** Este proyecto **no distribuye Aseprite compilado**. El binario generado está sujeto a la licencia EULA de Aseprite y solo puede ser usado **personalmente**. **Redistribuirlo está prohibido**.
 
 ---
 
 ## ✨ Características
 
 - 🔧 **Compilación automatizada** desde el código fuente original
-- 🐧 **Binario compatible con Linux** (incluso si compilas desde macOS o Windows)
+- 🐧 **Binario compatible con Linux** (aunque compiles desde macOS o Windows)
 - 📦 **Todas las dependencias incluidas** en la imagen Docker
 - ⚡ **Compilación reproducible y aislada** con Docker Buildx
 - 🧼 **Opción de limpieza** para liberar espacio tras la compilación
@@ -26,11 +26,11 @@ Este proyecto proporciona un contenedor Docker preconfigurado para **compilar As
 
 ## 📋 Requisitos
 
-- [Docker](https://www.docker.com/get-started) (recomendado: con soporte para `buildx`)
+- [Docker](https://www.docker.com/get-started) (con soporte opcional para `buildx`)
 - Acceso a Internet (para clonar y descargar dependencias)
 - Sistema operativo: cualquier sistema con Docker (Linux, macOS, Windows)
 
-> 🐧 **Nota**: El binario generado solo funcionará en sistemas **Linux**.
+> 🐧 **Nota:** El binario generado solo funcionará en sistemas **Linux**.
 
 ---
 
@@ -41,7 +41,6 @@ Este proyecto proporciona un contenedor Docker preconfigurado para **compilar As
 ```bash
 git clone https://github.com/santitub/aseprite-compiler.git
 cd aseprite-compiler
-```
 
 2️⃣ Da Permisos al Script
 
@@ -51,15 +50,15 @@ chmod +x build.sh
 
 ./build.sh
 
-✅ El proceso:
+✅ El proceso realiza:
 
-1. Construye una imagen Docker con todas las dependencias necesarias.
-
-
-2. Clona el repositorio oficial de Aseprite.
+1. Construcción de una imagen Docker con todas las dependencias.
 
 
-3. Compila Aseprite dentro del contenedor.
+2. Clonación del repositorio oficial de Aseprite.
+
+
+3. Compilación de Aseprite dentro del contenedor.
 
 
 
@@ -72,7 +71,7 @@ Los archivos de salida se colocan en:
 
 ./output/aseprite → Binario compilado (solo uso personal, no redistribuir)
 
-./aseprite_share → Recursos requeridos por Aseprite al ejecutarse
+./aseprite_share/ → Recursos requeridos por Aseprite al ejecutarse
 
 
 > ⚠️ Importante: No debes subir ni compartir estos archivos. Están sujetos a la EULA de Aseprite.
@@ -93,12 +92,17 @@ docker rmi aseprite
 
 ⚖️ Licencia y Aviso Legal
 
-🧑‍⚖️ Este proyecto está bajo la licencia MIT solo para el código del contenedor/script.
+🧑‍⚖️ Este proyecto está bajo la licencia MIT, solo para el código del contenedor/script.
 
 ❗ No estás autorizado a redistribuir el binario de Aseprite compilado mediante este script.
 
-🔗 Aseprite es un software con código fuente disponible, pero con un acuerdo de licencia restrictivo (EULA) respecto a su distribución.
+🔗 Aseprite es un software con código fuente disponible, pero con una licencia restrictiva (EULA) respecto a su distribución.
 
-🧾 Este proyecto no está afiliado ni respaldado por Igara Studio S.A..
+🧾 Este proyecto no está afiliado ni respaldado por Igara Studio S.A.
+
+
+
+---
 
 <p align="center"><sub>Desarrollado con ❤️ por <a href="https://github.com/santitub">Santitub</a></sub></p>
+```
