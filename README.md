@@ -42,20 +42,24 @@ Este proyecto proporciona un contenedor Docker preconfigurado para **compilar As
 git clone https://github.com/santitub/aseprite-compiler.git
 
 cd aseprite-compiler
+```
 
 
 ---
 
 2️⃣ Da Permisos al Script
 
+```
 chmod +x build.sh
-
+```
 
 ---
 
 3️⃣ Ejecuta la Compilación
 
+```
 ./build.sh
+```
 
 ✅ El proceso realiza automáticamente:
 
@@ -114,4 +118,3 @@ docker rmi aseprite
 ---
 
 <p align="center"><sub>Desarrollado con ❤️ por <a href="https://github.com/santitub">Santitub</a></sub></p>
-```
