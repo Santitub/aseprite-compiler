@@ -102,4 +102,3 @@ docker rmi aseprite
 🧾 Este proyecto no está afiliado ni respaldado por Igara Studio S.A..
 
 <p align="center"><sub>Desarrollado con ❤️ por <a href="https://github.com/santitub">Santitub</a></sub></p>
-```
