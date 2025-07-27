@@ -1,6 +1,6 @@
 # Aseprite Compiler 🖥️
 
-Este proyecto proporciona un contenedor Docker para compilar **Aseprite**, un popular editor de píxeles. El Dockerfile está configurado para compilar Aseprite desde su repositorio oficial, manejar todas las dependencias necesarias y exportar el binario resultante junto con sus recursos.
+Este proyecto proporciona un contenedor Docker para compilar **Aseprite**, un popular editor de píxel arts. El Dockerfile está configurado para compilar Aseprite desde su repositorio oficial, manejar todas las dependencias necesarias y exportar el binario resultante junto con sus recursos.
 
 > ⚠️ **Compatibilidad del binario:** El binario generado solo es compatible con **Linux**.
 > 🧪 **Versión testeada:** Este proyecto fue probado únicamente con **Aseprite v1.3.14**.
