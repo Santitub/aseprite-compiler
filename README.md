@@ -16,18 +16,18 @@ Este proyecto proporciona un contenedor Docker preconfigurado para **compilar As
 
 ## ✨ Características
 
-- 🔧 **Compilación automatizada** desde el código fuente original
-- 🐧 **Binario compatible con Linux** (aunque compiles desde macOS o Windows)
-- 📦 **Todas las dependencias incluidas** en la imagen Docker
-- ⚡ **Compilación reproducible y aislada** con Docker Buildx
-- 🧼 **Opción de limpieza** para liberar espacio tras la compilación
+- 🔧 **Compilación automatizada** desde el código fuente original  
+- 🐧 **Binario compatible con Linux** (aunque compiles desde macOS o Windows)  
+- 📦 **Todas las dependencias incluidas** en la imagen Docker  
+- ⚡ **Compilación reproducible y aislada** con Docker Buildx  
+- 🧼 **Opción de limpieza** para liberar espacio tras la compilación  
 
 ---
 
 ## 📋 Requisitos
 
-- [Docker](https://www.docker.com/get-started) (con soporte opcional para `buildx`)
-- Acceso a Internet (para clonar y descargar dependencias)
+- [Docker](https://www.docker.com/get-started) (con soporte opcional para `buildx`)  
+- Acceso a Internet (para clonar y descargar dependencias)  
 - Sistema operativo: cualquier sistema con Docker (Linux, macOS, Windows)
 
 > 🐧 **Nota:** El binario generado solo funcionará en sistemas **Linux**.
@@ -40,25 +40,36 @@ Este proyecto proporciona un contenedor Docker preconfigurado para **compilar As
 
 ```bash
 git clone https://github.com/santitub/aseprite-compiler.git
+
 cd aseprite-compiler
+
+
+---
 
 2️⃣ Da Permisos al Script
 
 chmod +x build.sh
 
+
+---
+
 3️⃣ Ejecuta la Compilación
 
 ./build.sh
 
-✅ El proceso realiza:
+✅ El proceso realiza automáticamente:
 
-1. Construcción de una imagen Docker con todas las dependencias.
+1. Construcción de una imagen Docker con todas las dependencias necesarias.
 
 
 2. Clonación del repositorio oficial de Aseprite.
 
 
-3. Compilación de Aseprite dentro del contenedor.
+3. Compilación del binario dentro del contenedor Docker.
+
+
+
+> 🔐 Nota: El binario generado es solo para uso personal. Redistribuirlo está prohibido según la EULA de Aseprite.
 
 
 
@@ -91,8 +102,6 @@ docker rmi aseprite
 ---
 
 ⚖️ Licencia y Aviso Legal
-
-🧑‍⚖️ Este proyecto está bajo la licencia MIT, solo para el código del contenedor/script.
 
 ❗ No estás autorizado a redistribuir el binario de Aseprite compilado mediante este script.
 
