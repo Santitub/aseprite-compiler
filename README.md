@@ -41,6 +41,7 @@ Este proyecto proporciona un contenedor Docker preconfigurado para **compilar As
 ```bash
 git clone https://github.com/santitub/aseprite-compiler.git
 cd aseprite-compiler
+```
 
 2️⃣ Da Permisos al Script
 
