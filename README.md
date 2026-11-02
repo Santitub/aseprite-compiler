@@ -173,8 +173,6 @@ build yourself.
 
 ## License
 
-The scripts in this repository are released under the MIT license.
-
 Aseprite is © Igara Studio S.A. Its
 [EULA](https://github.com/aseprite/aseprite/blob/main/EULA.txt) only allows
 you to compile it for personal use, and you may not distribute it to third
