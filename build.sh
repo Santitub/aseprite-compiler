@@ -13,7 +13,8 @@ set -Eeuo pipefail
 readonly SCRIPT_VERSION="4.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_NAME
 
 readonly ASEPRITE_REPO="aseprite/aseprite"
 readonly SKIA_REPO="aseprite/skia"
@@ -469,7 +470,8 @@ fetch_sources() {
   mkdir -p "$SOURCE_DIR"
 
   if [[ -n "$SOURCE_URL" ]]; then
-    local zip="$WORK_DIR/downloads/$(basename "$SOURCE_URL")"
+    local zip
+    zip="$WORK_DIR/downloads/$(basename "$SOURCE_URL")"
     if [[ -f "$zip" && -n "$SOURCE_SHA256" && "$(sha256_of "$zip")" != "$SOURCE_SHA256" ]]; then
       warn "cached $(basename "$zip") is corrupt, downloading it again"
       rm -f "$zip"
