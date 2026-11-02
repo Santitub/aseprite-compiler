@@ -22,16 +22,6 @@ on:
         description: Comma-separated targets (windows-x64, windows-arm64, linux-x64, linux-arm64, macos-x64, macos-arm64), or "all"
         required: true
         default: all
-  schedule:
-    # Daily check for a new Aseprite release; skipped when it was already built
-    - cron: "17 5 * * *"
-  pull_request:
-    paths:
-      - build.sh
-      - build.ps1
-      - build.bat
-      - scripts/**
-      - .github/workflows/build.yml
 
 permissions:
   contents: write
