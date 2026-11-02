@@ -348,8 +348,14 @@ install_dependencies() {
       xcode-select --install || true
       die "finish the Xcode command line tools installation and run this script again"
     fi
-    have brew || die "Homebrew is required to install dependencies: https://brew.sh"
-    brew install cmake ninja
+    local formula missing_formulae=()
+    for formula in cmake ninja; do
+      have "$formula" || missing_formulae+=("$formula")
+    done
+    if [[ ${#missing_formulae[@]} -gt 0 ]]; then
+      have brew || die "Homebrew is required to install ${missing_formulae[*]}: https://brew.sh"
+      brew install "${missing_formulae[@]}"
+    fi
   elif have apt-get; then
     run_privileged apt-get update -qq
     run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

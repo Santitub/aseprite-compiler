@@ -374,6 +374,30 @@ function Get-AsepriteSources($Release, [string]$Work) {
     return $dir
 }
 
+# Source fixes required to build with MSVC for ARM64. MSVC defines _WIN64 on
+# ARM64 as well, but some upstream code uses it to mean "x86-64". The edits
+# are idempotent and do not change the result on x64.
+function Repair-Sources([string]$SourceDir) {
+    $fixes = @(
+        @{ File = 'src\doc\primitives.cpp'
+           From = 'defined(__x86_64__) || defined(_WIN64)'
+           To   = 'defined(__x86_64__) || defined(_M_X64)' },
+        @{ File = 'laf\base\platform.h'
+           From = '#if defined(__arm64__) || defined(__aarch64__)'
+           To   = '#if defined(__arm64__) || defined(__aarch64__) || defined(_M_ARM64)' }
+    )
+    foreach ($fix in $fixes) {
+        $path = Join-Path $SourceDir $fix.File
+        if (-not (Test-Path $path)) { continue }
+        $text = [IO.File]::ReadAllText($path)
+        if ($text.Contains($fix.To)) { continue }
+        if ($text.Contains($fix.From)) {
+            [IO.File]::WriteAllText($path, $text.Replace($fix.From, $fix.To))
+            Write-Info "patched $($fix.File) for MSVC ARM64"
+        }
+    }
+}
+
 function Get-Skia([string]$SourceDir, [string]$TargetArch, [string]$Work, [string]$Ninja, [string]$VsPath) {
     Write-Step 'Preparing Skia'
     $tag = $SkiaTag
@@ -578,6 +602,7 @@ function Main {
 
     $release = Resolve-AsepriteRelease $Version
     $source = Get-AsepriteSources $release $work
+    Repair-Sources $source
     $skia = Get-Skia $source $targetArch $work $ninja $vs
     $bin = Build-Aseprite $source $skia $targetArch $work $cmake $ninja ([bool]$release.Url) $release.Tag
     $name = New-Package $bin $source $release.Tag $targetArch $skia.Tag $output
