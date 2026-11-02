@@ -127,7 +127,9 @@ function Invoke-WithRetry([scriptblock]$Action, [int]$Attempts = 4, [int]$DelayS
 # Runs a native command and fails on a non-zero exit code
 function Invoke-Native([string]$FilePath, [string[]]$Arguments) {
     Write-Verbose "$FilePath $($Arguments -join ' ')"
-    & $FilePath @Arguments
+    # Out-Host keeps the command output on screen without leaking it into
+    # the pipeline, where it would become part of the caller's return value.
+    & $FilePath @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Stop-Build "'$(Split-Path -Leaf $FilePath)' failed with exit code $LASTEXITCODE"
     }
