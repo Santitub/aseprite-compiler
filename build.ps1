@@ -377,24 +377,33 @@ function Get-AsepriteSources($Release, [string]$Work) {
 }
 
 # Source fixes required to build with MSVC for ARM64. MSVC defines _WIN64 on
-# ARM64 as well, but some upstream code uses it to mean "x86-64". The edits
-# are idempotent and do not change the result on x64.
+# ARM64 too, but some upstream preprocessor checks use it to mean "x86-64".
+# Each fix is a regular expression anchored to a whole line, so only those
+# exact checks change. The edits are idempotent and are no-ops on x64.
 function Repair-Sources([string]$SourceDir) {
     $fixes = @(
+        # SSE2 intrinsics guard: x86-64 only. The separate 64-bit pointer
+        # check in the same file starts with defined(__LP64__) and must keep
+        # _WIN64, so it does not match this pattern.
         @{ File = 'src\doc\primitives.cpp'
-           From = 'defined(__x86_64__) || defined(_WIN64)'
-           To   = 'defined(__x86_64__) || defined(_M_X64)' },
+           Pattern = '(?m)^(\s*#\s*if\s+defined\(__x86_64__\)\s*\|\|\s*)defined\(_WIN64\)'
+           Replacement = '${1}defined(_M_X64)' },
+        # Undo the over-broad edit made by build.ps1 4.0.0 in cached sources
+        @{ File = 'src\doc\primitives.cpp'
+           Pattern = '(?m)^(\s*#\s*if\s+defined\(__LP64__\)\s*\|\|\s*defined\(__x86_64__\)\s*\|\|\s*)defined\(_M_X64\)'
+           Replacement = '${1}defined(_WIN64)' },
+        # Report the right CPU architecture in the About dialog
         @{ File = 'laf\base\platform.h'
-           From = '#if defined(__arm64__) || defined(__aarch64__)'
-           To   = '#if defined(__arm64__) || defined(__aarch64__) || defined(_M_ARM64)' }
+           Pattern = '(?m)^(\s*#\s*if\s+defined\(__arm64__\)\s*\|\|\s*defined\(__aarch64__\))\s*$'
+           Replacement = '${1} || defined(_M_ARM64)' }
     )
     foreach ($fix in $fixes) {
         $path = Join-Path $SourceDir $fix.File
         if (-not (Test-Path $path)) { continue }
         $text = [IO.File]::ReadAllText($path)
-        if ($text.Contains($fix.To)) { continue }
-        if ($text.Contains($fix.From)) {
-            [IO.File]::WriteAllText($path, $text.Replace($fix.From, $fix.To))
+        $patched = [regex]::Replace($text, $fix.Pattern, $fix.Replacement)
+        if ($patched -ne $text) {
+            [IO.File]::WriteAllText($path, $patched)
             Write-Info "patched $($fix.File) for MSVC ARM64"
         }
     }
