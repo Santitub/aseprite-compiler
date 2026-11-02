@@ -1,0 +1,7 @@
+# Build artifacts and caches created by the build scripts
+/.work/
+/output/
+/build.log
+*.part
+__pycache__/
+.DS_Store
