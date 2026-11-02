@@ -1,1024 +1,903 @@
 #!/usr/bin/env bash
-# ============================================================================
-# SCRIPT DE COMPILACIÓN DE ASEPRITE
-# Autor: Santitub
-# Descripción: Compila Aseprite desde código fuente usando Docker
-# Uso: ./build.sh [opciones]
-# ============================================================================
+#
+# Aseprite build script for Linux and macOS.
+#
+# Builds Aseprite from the official source code, either natively or inside
+# a Docker container (Linux binaries only). Run `./build.sh --help` for the
+# full list of options.
+#
+# Compatible with bash 3.2 (the version shipped with macOS).
 
-# ----------------------------------------------------------------------------
-# CONFIGURACIÓN ESTRICTA
-# ----------------------------------------------------------------------------
-set -euo pipefail
-IFS=$'\n\t'
+set -Eeuo pipefail
 
-# ----------------------------------------------------------------------------
-# VARIABLES DE CONFIGURACIÓN
-# ----------------------------------------------------------------------------
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+readonly SCRIPT_VERSION="4.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
-# Configuración de Docker
-readonly IMAGE_NAME="aseprite-builder"
-readonly IMAGE_TAG="latest"
-readonly FULL_IMAGE_NAME="${IMAGE_NAME}:${IMAGE_TAG}"
+readonly ASEPRITE_REPO="aseprite/aseprite"
+readonly SKIA_REPO="aseprite/skia"
+readonly MIN_CMAKE_VERSION="3.20"
 
-# Directorios de salida
-readonly OUTPUT_DIR="${SCRIPT_DIR}/output"
+# ---------------------------------------------------------------------------
+# Defaults (every option can also be set through the environment)
+# ---------------------------------------------------------------------------
+ASEPRITE_VERSION="${ASEPRITE_VERSION:-latest}"
+SKIA_TAG="${SKIA_TAG:-}"
+TARGET_ARCH="${TARGET_ARCH:-}"
+BUILD_TYPE="${BUILD_TYPE:-Release}"
+WORK_DIR="${WORK_DIR:-$SCRIPT_DIR/.work}"
+OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/output}"
+JOBS="${JOBS:-}"
+USE_DOCKER="${USE_DOCKER:-0}"
+INSTALL_DEPS="${INSTALL_DEPS:-0}"
+ASSUME_YES="${ASSUME_YES:-0}"
+SKIA_FROM_SOURCE="${SKIA_FROM_SOURCE:-0}"
+FRESH_BUILD="${FRESH_BUILD:-0}"
+CREATE_ARCHIVE="${CREATE_ARCHIVE:-1}"
+VERBOSE="${VERBOSE:-0}"
 
-# URLs de GitHub
-readonly GITHUB_API_URL="https://api.github.com/repos/aseprite/aseprite/releases/latest"
-readonly GITHUB_RELEASES_URL="https://github.com/aseprite/aseprite/releases/latest"
-readonly SKIA_RELEASES_API="https://api.github.com/repos/aseprite/skia/releases"
+# Resolved at runtime
+HOST_OS=""
+HOST_ARCH=""
+SOURCE_DIR=""
+SKIA_DIR=""
+SKIA_LIB_DIR=""
+PACKAGE_NAME=""
+SOURCE_URL=""
+SOURCE_SHA256=""
+VERSION_NUMBER=""
 
-# Configuración de versiones (modificables)
-ASEPRITE_VERSION="${ASEPRITE_VERSION:-}"
-SKIA_VERSION="${SKIA_VERSION:-}"
-SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
-VERBOSE="${VERBOSE:-false}"
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
 
-# Configuración de build
-BUILD_TIMEOUT="${BUILD_TIMEOUT:-3600}"  # 1 hora por defecto
-DOCKER_PROGRESS="${DOCKER_PROGRESS:-plain}"  # plain, tty, auto
+# GitHub Actions log grouping, a no-op elsewhere
+in_ci() { [[ -n "${GITHUB_ACTIONS:-}" ]]; }
 
-# Variables de estado
-NEED_SUDO=false
-USE_BUILDX=false
-DOCKER_CMD="docker"
+step()  { if in_ci; then echo "::group::$*"; fi; printf '\n%s==>%s %s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$*" "$C_RESET" >&2; }
+endstep() { if in_ci; then echo "::endgroup::"; fi; }
+info()  { printf '    %s\n' "$*" >&2; }
+ok()    { printf '    %s%s%s\n' "$C_GREEN" "$*" "$C_RESET" >&2; }
+warn()  { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; if in_ci; then echo "::warning::$*"; fi; }
+debug() { if [[ "$VERBOSE" == "1" ]]; then printf '%s    [debug] %s%s\n' "$C_DIM" "$*" "$C_RESET" >&2; fi; }
+die()   { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; if in_ci; then echo "::error::$*"; fi; exit 1; }
 
-# Mapeo de versiones Aseprite -> Skia (compatibilidad conocida)
-declare -A SKIA_COMPAT_MAP=(
-    ["v1.3.15"]="m124-08a5439a6b"
-    ["v1.3.14"]="m124-08a5439a6b"
-    ["v1.3.13"]="m124-08a5439a6b"
-    ["v1.3.12"]="m124-08a5439a6b"
-    ["v1.3.11"]="m124-08a5439a6b"
-    ["v1.3.10"]="m124-08a5439a6b"
-    ["v1.3.9"]="m102-861e4743af"
-    ["v1.3.8"]="m102-861e4743af"
-    ["v1.3.7"]="m102-861e4743af"
-    ["v1.3.6"]="m102-861e4743af"
-    ["v1.3.5"]="m102-861e4743af"
-    ["v1.3.4"]="m102-861e4743af"
-    ["v1.3.3"]="m102-861e4743af"
-    ["v1.3.2"]="m102-861e4743af"
-    ["v1.3"]="m102-861e4743af"
-    ["v1.2"]="m96-1e2bef7700"
-)
-
-# Versión de Skia por defecto para versiones nuevas
-DEFAULT_SKIA_VERSION="m124-08a5439a6b"
-
-# ----------------------------------------------------------------------------
-# COLORES Y FORMATO
-# ----------------------------------------------------------------------------
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly PURPLE='\033[0;35m'
-readonly CYAN='\033[0;36m'
-readonly WHITE='\033[1;37m'
-readonly NC='\033[0m'
-
-# ----------------------------------------------------------------------------
-# FUNCIONES DE UTILIDAD
-# ----------------------------------------------------------------------------
-
-log() {
-    local level="$1"
-    shift
-    local message="$*"
-    local timestamp
-    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    
-    case "$level" in
-        INFO)    echo -e "${BLUE}[${timestamp}]${NC} ${GREEN}[INFO]${NC}    $message" >&2 ;;
-        WARN)    echo -e "${BLUE}[${timestamp}]${NC} ${YELLOW}[WARN]${NC}    $message" >&2 ;;
-        ERROR)   echo -e "${BLUE}[${timestamp}]${NC} ${RED}[ERROR]${NC}   $message" >&2 ;;
-        SUCCESS) echo -e "${BLUE}[${timestamp}]${NC} ${GREEN}[SUCCESS]${NC} $message" >&2 ;;
-        DEBUG)   
-            if [[ "$VERBOSE" == "true" ]]; then
-                echo -e "${BLUE}[${timestamp}]${NC} ${PURPLE}[DEBUG]${NC}   $message" >&2
-            fi
-            ;;
-        *)       echo -e "${BLUE}[${timestamp}]${NC} $message" >&2 ;;
-    esac
+on_error() {
+  local code=$? line=$1 cmd=$2
+  printf '%serror:%s command failed with exit code %s at line %s:\n    %s\n' \
+    "$C_RED" "$C_RESET" "$code" "$line" "$cmd" >&2
+  exit "$code"
 }
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
-# Función para ejecutar comandos en modo verbose
-run_cmd() {
-    if [[ "$VERBOSE" == "true" ]]; then
-        log DEBUG "Ejecutando: $*"
-        "$@"
-    else
-        "$@"
-    fi
-}
+usage() {
+  cat <<EOF
+Build Aseprite from the official source code.
 
-print_banner() {
-    echo -e "${CYAN}"
-    cat << 'EOF'
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                                                               ║
-    ║     █████╗ ███████╗███████╗██████╗ ██████╗ ██╗████████╗███████╗║
-    ║    ██╔══██╗██╔════╝██╔════╝██╔══██╗██╔══██╗██║╚══██╔══╝██╔════╝║
-    ║    ███████║███████╗█████╗  ██████╔╝██████╔╝██║   ██║   █████╗  ║
-    ║    ██╔══██║╚════██║██╔══╝  ██╔═══╝ ██╔══██╗██║   ██║   ██╔══╝  ║
-    ║    ██║  ██║███████║███████╗██║     ██║  ██║██║   ██║   ███████╗║
-    ║    ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝   ╚═╝   ╚══════╝║
-    ║                                                               ║
-    ║                    BUILDER v3.0                               ║
-    ║                                                               ║
-    ╚═══════════════════════════════════════════════════════════════╝
-EOF
-    echo -e "${NC}"
-}
+Usage: $SCRIPT_NAME [options]
 
-show_usage() {
-    cat << EOF
-${WHITE}Uso:${NC} $SCRIPT_NAME [opciones]
+Options:
+  -v, --version TAG       Aseprite release to build (default: latest), e.g. v1.3.18.6
+  -a, --arch ARCH         Target architecture: x64 or arm64 (default: host)
+  -s, --skia TAG          Override the Skia tag (default: read from the sources)
+      --skia-from-source  Always compile Skia instead of downloading a prebuilt package
+  -t, --build-type TYPE   Release or RelWithDebInfo (default: Release)
+  -j, --jobs N            Parallel compile jobs (default: based on CPUs and RAM)
+  -o, --output DIR        Output directory (default: ./output)
+  -w, --work-dir DIR      Directory for downloads and build files (default: ./.work)
+  -d, --docker            Build inside Docker (produces a Linux binary)
+  -i, --install-deps      Install the required system packages before building
+      --fresh             Discard previous build files for this version
+      --no-archive        Do not create a .tar.gz / .dmg, keep only the folder
+  -y, --yes               Do not ask for confirmation
+  -l, --list              List the most recent Aseprite releases and exit
+      --clean             Remove the work and output directories and exit
+      --verbose           Print additional diagnostic information
+  -h, --help              Show this help and exit
+      --script-version    Print the version of this script and exit
 
-${WHITE}Opciones:${NC}
-    -h, --help              Mostrar esta ayuda
-    -v, --verbose           Modo verbose (más información)
-    -V, --version VERSION   Especificar versión de Aseprite (default: latest)
-    -S, --skia VERSION      Especificar versión de Skia (default: auto)
-    -s, --skip-cleanup      No preguntar por eliminar imagen al final
-    -c, --clean             Limpiar todo (imágenes, contenedores, output)
-    -l, --list-versions     Mostrar últimas versiones disponibles
-    -t, --timeout SECONDS   Timeout para el build (default: 3600)
-    
-${WHITE}Variables de entorno:${NC}
-    ASEPRITE_VERSION        Versión de Aseprite a compilar
-    SKIA_VERSION            Versión de Skia a usar
-    SKIP_CLEANUP            Si es "true", no elimina la imagen al final
-    VERBOSE                 Si es "true", muestra más información
-    BUILD_TIMEOUT           Timeout en segundos para el build
-    DOCKER_PROGRESS         Modo de progreso de Docker (plain, tty, auto)
+Environment:
+  GITHUB_TOKEN            Optional. Raises the GitHub API rate limit.
+  Every option above also has an environment variable equivalent, e.g.
+  ASEPRITE_VERSION, TARGET_ARCH, SKIA_TAG, BUILD_TYPE, JOBS, OUTPUT_DIR.
 
-${WHITE}Ejemplos:${NC}
-    $SCRIPT_NAME                              # Compilar última versión
-    $SCRIPT_NAME -V v1.3.7                    # Compilar versión específica
-    $SCRIPT_NAME -V v1.3.7 -S m102-861e4743af # Versión específica de Skia
-    $SCRIPT_NAME -v -s                        # Modo verbose, sin preguntar cleanup
-    $SCRIPT_NAME -l                           # Listar versiones disponibles
-    VERBOSE=true $SCRIPT_NAME                 # Usando variable de entorno
+Examples:
+  $SCRIPT_NAME                          Build the latest release for this machine
+  $SCRIPT_NAME -v v1.3.17 -y            Build a specific release without prompts
+  $SCRIPT_NAME --install-deps           Install dependencies, then build
+  $SCRIPT_NAME --docker                 Build a Linux binary using Docker
+
+The resulting binary is covered by the Aseprite EULA: it is for personal use
+only and must not be redistributed.
 EOF
 }
 
-# ----------------------------------------------------------------------------
-# VERIFICACIÓN DE ARQUITECTURA
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
 
-check_architecture() {
-    log INFO "Verificando arquitectura del sistema..."
-    
-    local arch
-    arch=$(uname -m)
-    
-    case "$arch" in
-        x86_64|amd64)
-            log SUCCESS "Arquitectura compatible: $arch (x86_64)"
-            ;;
-        aarch64|arm64)
-            log WARN "Arquitectura ARM detectada: $arch"
-            log WARN "La compilación usará emulación QEMU (muy lenta, 2-4 horas)."
-            log WARN "Considera compilar en una máquina x86_64."
-            echo ""
-            read -r -p "¿Deseas continuar de todos modos? (s/n): " confirm
-            if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
-                log INFO "Operación cancelada."
-                exit 0
-            fi
-            ;;
-        *)
-            log ERROR "Arquitectura no soportada: $arch"
-            log ERROR "Este script solo soporta x86_64 (amd64) y arm64."
-            exit 1
-            ;;
+confirm() {
+  local prompt=$1 reply
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  if [[ ! -t 0 ]]; then
+    die "$prompt (refusing to continue in non-interactive mode, use --yes)"
+  fi
+  read -r -p "$prompt [y/N] " reply
+  [[ "$reply" =~ ^[YySs]$ ]]
+}
+
+# version_ge A B: true when version A >= version B
+version_ge() {
+  [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" == "$2" ]]
+}
+
+retry() {
+  local attempts=$1 delay=$2 n=1
+  shift 2
+  until "$@"; do
+    if (( n >= attempts )); then
+      return 1
+    fi
+    warn "attempt $n/$attempts failed, retrying in ${delay}s: $*"
+    sleep "$delay"
+    n=$((n + 1))
+    delay=$((delay * 2))
+  done
+}
+
+curl_github() {
+  # GitHub API request with optional authentication
+  local url=$1
+  local -a args=(-fsSL --connect-timeout 20 --max-time 120
+                 -H "Accept: application/vnd.github+json"
+                 -H "X-GitHub-Api-Version: 2022-11-28")
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  fi
+  curl "${args[@]}" "$url"
+}
+
+github_api() {
+  local path=$1 out
+  out="$(retry 4 3 curl_github "https://api.github.com/$path")" || return 1
+  printf '%s' "$out"
+}
+
+download() {
+  local url=$1 dest=$2 tmp="$2.part"
+  mkdir -p "$(dirname "$dest")"
+  info "downloading $(basename "$dest")"
+  debug "$url"
+  local -a progress=(-sS)
+  if [[ -t 2 ]] && ! in_ci; then progress=(--progress-bar); fi
+  if ! retry 4 5 curl -fL --connect-timeout 30 --retry 3 --retry-delay 3 \
+        "${progress[@]}" -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    die "unable to download $url"
+  fi
+  mv -f "$tmp" "$dest"
+}
+
+sha256_of() {
+  if have sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# json_query EXPRESSION: reads JSON from stdin, evaluates a Python expression
+# where `d` is the parsed document. Prints nothing when the value is missing.
+json_query() {
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    v = eval(sys.argv[1], {"__builtins__": {}}, {"d": d, "next": next, "len": len})
+except Exception:
+    sys.exit(0)
+if v is None:
+    sys.exit(0)
+if isinstance(v, (list, tuple)):
+    print("\n".join(str(x) for x in v))
+else:
+    print(v)
+' "$1"
+}
+
+cpu_count() {
+  if have nproc; then nproc
+  elif have sysctl; then sysctl -n hw.ncpu
+  else echo 2
+  fi
+}
+
+memory_gb() {
+  local kb
+  if [[ -r /proc/meminfo ]]; then
+    kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    echo $((kb / 1024 / 1024))
+  elif have sysctl; then
+    echo $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
+  else
+    echo 4
+  fi
+}
+
+free_disk_gb() {
+  local dir=$1
+  while [[ ! -d "$dir" ]]; do dir="$(dirname "$dir")"; done
+  df -Pk "$dir" | awk 'NR==2 {print int($4 / 1024 / 1024)}'
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+need_value() {
+  [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "option $1 requires a value"
+}
+
+parse_args() {
+  local action=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -v|--version)     need_value "$@"; ASEPRITE_VERSION=$2; shift 2 ;;
+      -a|--arch)        need_value "$@"; TARGET_ARCH=$2; shift 2 ;;
+      -s|--skia)        need_value "$@"; SKIA_TAG=$2; shift 2 ;;
+      --skia-from-source) SKIA_FROM_SOURCE=1; shift ;;
+      -t|--build-type)  need_value "$@"; BUILD_TYPE=$2; shift 2 ;;
+      -j|--jobs)        need_value "$@"; JOBS=$2; shift 2 ;;
+      -o|--output)      need_value "$@"; OUTPUT_DIR=$2; shift 2 ;;
+      -w|--work-dir)    need_value "$@"; WORK_DIR=$2; shift 2 ;;
+      -d|--docker)      USE_DOCKER=1; shift ;;
+      -i|--install-deps) INSTALL_DEPS=1; shift ;;
+      --fresh)          FRESH_BUILD=1; shift ;;
+      --no-archive)     CREATE_ARCHIVE=0; shift ;;
+      -y|--yes)         ASSUME_YES=1; shift ;;
+      -l|--list)        action=list; shift ;;
+      --clean)          action=clean; shift ;;
+      --verbose)        VERBOSE=1; shift ;;
+      -h|--help)        usage; exit 0 ;;
+      --script-version) echo "$SCRIPT_VERSION"; exit 0 ;;
+      *) die "unknown option: $1 (see --help)" ;;
     esac
+  done
+
+  case "$BUILD_TYPE" in
+    Release|RelWithDebInfo) ;;
+    *) die "invalid build type: $BUILD_TYPE (use Release or RelWithDebInfo)" ;;
+  esac
+  if [[ -n "$JOBS" && ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    die "invalid number of jobs: $JOBS"
+  fi
+  if [[ "$ASEPRITE_VERSION" != "latest" && "$ASEPRITE_VERSION" != v* ]]; then
+    ASEPRITE_VERSION="v$ASEPRITE_VERSION"
+  fi
+
+  mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+  WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+  OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+
+  case "$action" in
+    list)  list_versions; exit 0 ;;
+    clean) clean_all; exit 0 ;;
+  esac
 }
 
-# ----------------------------------------------------------------------------
-# CONFIGURACIÓN DE DOCKER
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+detect_platform() {
+  case "$(uname -s)" in
+    Linux)  HOST_OS=linux ;;
+    Darwin) HOST_OS=macos ;;
+    MINGW*|MSYS*|CYGWIN*) die "use build.bat or build.ps1 on Windows" ;;
+    *) die "unsupported operating system: $(uname -s)" ;;
+  esac
 
-setup_docker_command() {
-    if [[ "$NEED_SUDO" == "true" ]]; then
-        DOCKER_CMD="sudo docker"
-    else
-        DOCKER_CMD="docker"
-    fi
-    log DEBUG "Comando Docker configurado: $DOCKER_CMD"
+  case "$(uname -m)" in
+    x86_64|amd64)  HOST_ARCH=x64 ;;
+    aarch64|arm64) HOST_ARCH=arm64 ;;
+    *) die "unsupported CPU architecture: $(uname -m)" ;;
+  esac
+
+  # A x86_64 shell under Rosetta 2 reports x86_64 on Apple Silicon
+  if [[ "$HOST_OS" == macos && "$HOST_ARCH" == x64 ]] &&
+     [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" == "1" ]]; then
+    HOST_ARCH=arm64
+  fi
+
+  case "${TARGET_ARCH:-$HOST_ARCH}" in
+    x64|x86_64|amd64)  TARGET_ARCH=x64 ;;
+    arm64|aarch64)     TARGET_ARCH=arm64 ;;
+    *) die "invalid architecture: $TARGET_ARCH (use x64 or arm64)" ;;
+  esac
+
+  if [[ "$USE_DOCKER" == "0" && "$HOST_OS" == linux && "$TARGET_ARCH" != "$HOST_ARCH" ]]; then
+    die "cross-compiling on Linux is not supported; use --docker to build for $TARGET_ARCH under emulation"
+  fi
 }
 
-# Ejecutar docker con o sin sudo
-run_docker() {
-    if [[ "$NEED_SUDO" == "true" ]]; then
-        sudo docker "$@"
-    else
-        docker "$@"
-    fi
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+run_privileged() {
+  if [[ "$(id -u)" == "0" ]]; then
+    "$@"
+  elif have sudo; then
+    sudo "$@"
+  else
+    die "root privileges are required to run: $*"
+  fi
 }
 
-check_docker_permissions() {
-    log INFO "Verificando permisos de Docker..."
-    
-    if ! command -v docker &> /dev/null; then
-        log ERROR "Docker no está instalado."
-        log ERROR "Por favor, instala Docker: https://docs.docker.com/get-docker/"
-        exit 1
+install_dependencies() {
+  step "Installing system dependencies"
+  if [[ "$HOST_OS" == macos ]]; then
+    if ! xcode-select -p >/dev/null 2>&1; then
+      info "installing the Xcode command line tools"
+      xcode-select --install || true
+      die "finish the Xcode command line tools installation and run this script again"
     fi
-    
-    if docker info &> /dev/null 2>&1; then
-        log SUCCESS "Docker funciona sin privilegios elevados."
-        NEED_SUDO=false
-        setup_docker_command
-        return 0
-    fi
-    
-    log WARN "Docker requiere privilegios elevados (sudo)."
-    
-    if ! command -v sudo &> /dev/null; then
-        log ERROR "sudo no está disponible y Docker requiere privilegios elevados."
-        log ERROR "Opciones:"
-        log ERROR "  1. Ejecuta este script como root"
-        log ERROR "  2. Añade tu usuario al grupo docker: sudo usermod -aG docker \$USER"
-        exit 1
-    fi
-    
-    echo ""
-    echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${YELLOW}│  Docker requiere privilegios de administrador (sudo)            │${NC}"
-    echo -e "${YELLOW}│                                                                 │${NC}"
-    echo -e "${YELLOW}│  Se te pedirá la contraseña para ejecutar comandos Docker.      │${NC}"
-    echo -e "${YELLOW}│                                                                 │${NC}"
-    echo -e "${YELLOW}│  Para evitar esto en el futuro, ejecuta:                        │${NC}"
-    echo -e "${YELLOW}│    sudo usermod -aG docker \$USER                                │${NC}"
-    echo -e "${YELLOW}│  Y luego cierra sesión y vuelve a iniciar.                      │${NC}"
-    echo -e "${YELLOW}└─────────────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    
-    log INFO "Solicitando credenciales de sudo..."
-    
-    if sudo -v; then
-        log SUCCESS "Credenciales de sudo validadas."
-        NEED_SUDO=true
-        setup_docker_command
-        
-        # Mantener sudo activo con timeout extendido
-        (
-            while true; do
-                sudo -n true 2>/dev/null
-                sleep 50
-                kill -0 "$$" 2>/dev/null || exit
-            done
-        ) &
-        
-        return 0
-    else
-        log ERROR "No se pudieron validar las credenciales de sudo."
-        exit 1
-    fi
+    have brew || die "Homebrew is required to install dependencies: https://brew.sh"
+    brew install cmake ninja
+  elif have apt-get; then
+    run_privileged apt-get update -qq
+    run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl git unzip python3 cmake ninja-build clang g++ \
+      libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
+  elif have dnf; then
+    run_privileged dnf install -y curl git unzip python3 cmake ninja-build clang gcc-c++ \
+      libX11-devel libXcursor-devel libXi-devel libXrandr-devel mesa-libGL-devel fontconfig-devel
+  elif have pacman; then
+    run_privileged pacman -S --needed --noconfirm curl git unzip python cmake ninja clang gcc \
+      libx11 libxcursor libxi libxrandr mesa fontconfig
+  elif have zypper; then
+    run_privileged zypper --non-interactive install curl git unzip python3 cmake ninja clang gcc-c++ \
+      libX11-devel libXcursor-devel libXi-devel libXrandr-devel Mesa-libGL-devel fontconfig-devel
+  else
+    die "unsupported package manager; install the dependencies listed in README.md manually"
+  fi
+  ok "dependencies installed"
+  endstep
 }
 
-check_docker_running() {
-    log INFO "Verificando que Docker está activo..."
-    
-    # Pequeña pausa para asegurar que sudo esté listo
-    sleep 1
-    
-    local docker_output
-    local docker_exit_code
-    
-    # Capturar salida y código de error
-    if [[ "$NEED_SUDO" == "true" ]]; then
-        docker_output=$(sudo docker info 2>&1) && docker_exit_code=0 || docker_exit_code=$?
-    else
-        docker_output=$(docker info 2>&1) && docker_exit_code=0 || docker_exit_code=$?
+check_dependencies() {
+  step "Checking build requirements"
+  local missing=() tool
+  for tool in curl git unzip python3 cmake ninja; do
+    have "$tool" || missing+=("$tool")
+  done
+  if [[ "$HOST_OS" == macos ]]; then
+    xcode-select -p >/dev/null 2>&1 || missing+=("xcode-command-line-tools")
+  elif ! have clang++ && ! have g++; then
+    missing+=("clang++ or g++")
+  fi
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    die "missing required tools: ${missing[*]} (run with --install-deps or see README.md)"
+  fi
+
+  local cmake_version
+  cmake_version="$(cmake --version | awk 'NR==1 {print $3}')"
+  version_ge "$cmake_version" "$MIN_CMAKE_VERSION" ||
+    die "CMake $MIN_CMAKE_VERSION or newer is required (found $cmake_version)"
+  info "cmake   $cmake_version"
+  info "ninja   $(ninja --version)"
+  info "git     $(git --version | awk '{print $3}')"
+  info "python  $(python3 -c 'import platform; print(platform.python_version())')"
+
+  if [[ "$HOST_OS" == linux ]]; then
+    local pkg missing_libs=()
+    if have pkg-config; then
+      for pkg in x11 xcursor xi xrandr gl fontconfig; do
+        pkg-config --exists "$pkg" || missing_libs+=("$pkg")
+      done
+      if [[ ${#missing_libs[@]} -gt 0 ]]; then
+        die "missing development libraries: ${missing_libs[*]} (run with --install-deps)"
+      fi
     fi
-    
-    if [[ $docker_exit_code -eq 0 ]]; then
-        log SUCCESS "Docker está activo y funcionando."
-        return 0
-    fi
-    
-    log ERROR "Docker no está respondiendo correctamente."
-    log DEBUG "Salida de docker info: $docker_output"
-    
-    if command -v systemctl &> /dev/null; then
-        if systemctl is-active --quiet docker 2>/dev/null; then
-            log WARN "El servicio Docker está activo pero no responde."
-            log WARN "Esto puede ser un problema de permisos del socket."
-            
-            # Mostrar información del socket
-            if [[ -S /var/run/docker.sock ]]; then
-                local socket_info
-                socket_info=$(ls -la /var/run/docker.sock 2>/dev/null || echo "No disponible")
-                log DEBUG "Socket Docker: $socket_info"
-            fi
-        else
-            log ERROR "El servicio Docker no está activo."
-            log ERROR "Inicia el servicio con: sudo systemctl start docker"
-        fi
-    fi
-    
-    exit 1
+  fi
+  ok "all requirements satisfied"
+  endstep
 }
 
-check_docker_buildx() {
-    log INFO "Verificando Docker Buildx..."
-    
-    if run_docker buildx version > /dev/null 2>&1; then
-        USE_BUILDX=true
-        log SUCCESS "Docker Buildx disponible."
-    else
-        USE_BUILDX=false
-        log WARN "Docker Buildx no disponible. Usando build clásico."
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# MANEJO DE VERSIONES
-# ----------------------------------------------------------------------------
-
-get_latest_version() {
-    log INFO "Obteniendo última versión de Aseprite desde GitHub..."
-    
-    local version=""
-    
-    if command -v curl &> /dev/null; then
-        log DEBUG "Intentando con GitHub API..."
-        
-        version=$(curl -sL --connect-timeout 10 "$GITHUB_API_URL" 2>/dev/null | \
-            grep -o '"tag_name": *"[^"]*"' | \
-            head -1 | \
-            sed 's/"tag_name": *"\([^"]*\)"/\1/')
-        
-        if [[ -n "$version" ]]; then
-            log DEBUG "Versión obtenida via API: $version"
-            echo "$version"
-            return 0
-        fi
-        
-        log DEBUG "API falló, intentando con redirección..."
-        
-        version=$(curl -sIL --connect-timeout 10 "$GITHUB_RELEASES_URL" 2>/dev/null | \
-            grep -i "^location:" | \
-            tail -1 | \
-            sed 's/.*\/tag\///' | \
-            tr -d '\r\n ')
-        
-        if [[ -n "$version" ]]; then
-            log DEBUG "Versión obtenida via redirección: $version"
-            echo "$version"
-            return 0
-        fi
-    fi
-    
-    if command -v wget &> /dev/null; then
-        log DEBUG "Intentando con wget..."
-        
-        version=$(wget -qO- --timeout=10 "$GITHUB_API_URL" 2>/dev/null | \
-            grep -o '"tag_name": *"[^"]*"' | \
-            head -1 | \
-            sed 's/"tag_name": *"\([^"]*\)"/\1/')
-        
-        if [[ -n "$version" ]]; then
-            log DEBUG "Versión obtenida via wget: $version"
-            echo "$version"
-            return 0
-        fi
-    fi
-    
-    log ERROR "No se pudo obtener la última versión de Aseprite."
-    log ERROR "Verifica tu conexión a internet o especifica una versión manualmente con -V"
-    return 1
-}
-
-# Verificar que una versión existe en GitHub
-verify_version_exists() {
-    local version="$1"
-    
-    log INFO "Verificando que la versión $version existe..."
-    
-    local http_code
-    http_code=$(curl -sL -o /dev/null -w "%{http_code}" \
-        "https://api.github.com/repos/aseprite/aseprite/releases/tags/${version}" 2>/dev/null)
-    
-    if [[ "$http_code" == "200" ]]; then
-        log SUCCESS "Versión $version verificada en GitHub."
-        return 0
-    else
-        log ERROR "La versión $version no existe en GitHub (HTTP $http_code)."
-        log ERROR "Usa --list-versions para ver versiones disponibles."
-        return 1
-    fi
-}
-
-# Obtener versión de Skia compatible
-get_compatible_skia_version() {
-    local aseprite_version="$1"
-    
-    # Extraer versión base (v1.3.15.4 -> v1.3.15, v1.3.7 -> v1.3.7)
-    local base_version
-    base_version=$(echo "$aseprite_version" | sed -E 's/^(v[0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/')
-    
-    log DEBUG "Buscando Skia compatible para Aseprite $aseprite_version (base: $base_version)"
-    
-    # Buscar en el mapa de compatibilidad
-    if [[ -n "${SKIA_COMPAT_MAP[$base_version]:-}" ]]; then
-        echo "${SKIA_COMPAT_MAP[$base_version]}"
-        return 0
-    fi
-    
-    # Para versiones v1.3.x no mapeadas, usar la más reciente
-    if [[ "$base_version" =~ ^v1\.3 ]]; then
-        echo "$DEFAULT_SKIA_VERSION"
-        return 0
-    fi
-    
-    # Para versiones muy antiguas v1.2.x
-    if [[ "$base_version" =~ ^v1\.2 ]]; then
-        echo "m96-1e2bef7700"
-        return 0
-    fi
-    
-    # Default para versiones desconocidas
-    log WARN "Versión no mapeada, usando Skia por defecto: $DEFAULT_SKIA_VERSION"
-    echo "$DEFAULT_SKIA_VERSION"
-}
-
-# Verificar que la versión de Skia existe
-verify_skia_version() {
-    local skia_version="$1"
-    
-    log INFO "Verificando que Skia $skia_version existe..."
-    
-    local http_code
-    http_code=$(curl -sL -o /dev/null -w "%{http_code}" \
-        "https://github.com/aseprite/skia/releases/download/${skia_version}/Skia-Linux-Release-x64.zip" 2>/dev/null)
-    
-    if [[ "$http_code" == "200" || "$http_code" == "302" ]]; then
-        log SUCCESS "Skia $skia_version verificada."
-        return 0
-    else
-        log ERROR "Skia $skia_version no encontrada (HTTP $http_code)."
-        return 1
-    fi
-}
-
+# ---------------------------------------------------------------------------
+# Versions
+# ---------------------------------------------------------------------------
 list_versions() {
-    log INFO "Obteniendo lista de versiones de Aseprite..."
-    
-    echo ""
-    echo -e "${WHITE}Últimas versiones disponibles:${NC}"
-    echo ""
-    
-    if command -v curl &> /dev/null; then
-        local versions
-        versions=$(curl -sL "https://api.github.com/repos/aseprite/aseprite/releases" 2>/dev/null | \
-            grep -o '"tag_name": *"[^"]*"' | \
-            head -10 | \
-            sed 's/"tag_name": *"\([^"]*\)"/\1/')
-        
-        if [[ -n "$versions" ]]; then
-            local first=true
-            while IFS= read -r ver; do
-                local base_ver
-                base_ver=$(echo "$ver" | sed -E 's/^(v[0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/')
-                local skia_ver="${SKIA_COMPAT_MAP[$base_ver]:-$DEFAULT_SKIA_VERSION}"
-                
-                if [[ "$first" == true ]]; then
-                    echo -e "  ${GREEN}➜ $ver${NC} (latest) - Skia: $skia_ver"
-                    first=false
-                else
-                    echo -e "  ${CYAN}  $ver${NC} - Skia: $skia_ver"
-                fi
-            done <<< "$versions"
-            echo ""
-            return 0
-        fi
-    fi
-    
-    log ERROR "No se pudieron obtener las versiones."
-    return 1
+  have python3 || die "python3 is required"
+  local json
+  json="$(github_api "repos/$ASEPRITE_REPO/releases?per_page=15")" ||
+    die "unable to query GitHub releases"
+  printf '%sRecent Aseprite releases:%s\n' "$C_BOLD" "$C_RESET"
+  printf '%s' "$json" | json_query \
+    '[("  %-16s %s%s" % (r["tag_name"], r["published_at"][:10], "  (pre-release)" if r["prerelease"] else "")) for r in d]'
 }
 
-validate_version() {
-    local version="$1"
-    
-    if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?(\.[0-9]+)?(-[a-zA-Z0-9]+)?$ ]]; then
-        log WARN "El formato de versión '$version' podría no ser válido."
-        log WARN "Formato esperado: v1.3.7, v1.3.15.4, v1.3.7-beta, etc."
-        
-        read -r -p "¿Deseas continuar de todos modos? (s/n): " confirm
-        if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
-            log INFO "Operación cancelada."
-            exit 0
-        fi
-    fi
+resolve_version() {
+  step "Resolving Aseprite version"
+  local json
+  if [[ "$ASEPRITE_VERSION" == "latest" ]]; then
+    json="$(github_api "repos/$ASEPRITE_REPO/releases/latest")" ||
+      die "unable to determine the latest Aseprite release (set GITHUB_TOKEN if you are rate limited)"
+  else
+    json="$(github_api "repos/$ASEPRITE_REPO/releases/tags/$ASEPRITE_VERSION")" ||
+      die "release $ASEPRITE_VERSION was not found (use --list to see the available releases)"
+  fi
+
+  ASEPRITE_VERSION="$(printf '%s' "$json" | json_query 'd["tag_name"]')"
+  [[ -n "$ASEPRITE_VERSION" ]] || die "unexpected response from the GitHub API"
+  VERSION_NUMBER="${ASEPRITE_VERSION#v}"
+
+  SOURCE_URL="$(printf '%s' "$json" | json_query \
+    'next((a["browser_download_url"] for a in d["assets"] if a["name"].endswith("-Source.zip")), None)')"
+  SOURCE_SHA256="$(printf '%s' "$json" | json_query \
+    'next((a.get("digest") or "" for a in d["assets"] if a["name"].endswith("-Source.zip")), "")')"
+  SOURCE_SHA256="${SOURCE_SHA256#sha256:}"
+
+  info "version  $ASEPRITE_VERSION"
+  if [[ -n "$SOURCE_URL" ]]; then
+    info "source   $(basename "$SOURCE_URL")"
+  else
+    info "source   git clone (no source package published for this release)"
+  fi
+  endstep
 }
 
-setup_versions() {
-    # Configurar versión de Aseprite
-    if [[ -z "$ASEPRITE_VERSION" ]]; then
-        log INFO "No se especificó versión, obteniendo la última..."
-        
-        ASEPRITE_VERSION=$(get_latest_version) || {
-            log ERROR "No se pudo determinar la versión a compilar."
-            exit 1
-        }
-        
-        log SUCCESS "Versión detectada: $ASEPRITE_VERSION"
-    else
-        log INFO "Versión especificada por usuario: $ASEPRITE_VERSION"
-        validate_version "$ASEPRITE_VERSION"
-        verify_version_exists "$ASEPRITE_VERSION" || exit 1
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+fetch_sources() {
+  step "Fetching Aseprite $ASEPRITE_VERSION sources"
+  SOURCE_DIR="$WORK_DIR/src/aseprite-$ASEPRITE_VERSION"
+  local marker="$SOURCE_DIR/.aseprite-compiler-complete"
+
+  if [[ -f "$marker" ]]; then
+    ok "reusing sources in $SOURCE_DIR"
+    endstep
+    return
+  fi
+  rm -rf "$SOURCE_DIR"
+  mkdir -p "$SOURCE_DIR"
+
+  if [[ -n "$SOURCE_URL" ]]; then
+    local zip="$WORK_DIR/downloads/$(basename "$SOURCE_URL")"
+    if [[ -f "$zip" && -n "$SOURCE_SHA256" && "$(sha256_of "$zip")" != "$SOURCE_SHA256" ]]; then
+      warn "cached $(basename "$zip") is corrupt, downloading it again"
+      rm -f "$zip"
     fi
-    
-    # Configurar versión de Skia
-    if [[ -z "$SKIA_VERSION" ]]; then
-        log INFO "Determinando versión de Skia compatible..."
-        SKIA_VERSION=$(get_compatible_skia_version "$ASEPRITE_VERSION")
-        log SUCCESS "Skia seleccionada: $SKIA_VERSION"
-    else
-        log INFO "Versión de Skia especificada: $SKIA_VERSION"
+    [[ -f "$zip" ]] || download "$SOURCE_URL" "$zip"
+    if [[ -n "$SOURCE_SHA256" ]]; then
+      local actual
+      actual="$(sha256_of "$zip")"
+      if [[ "$actual" != "$SOURCE_SHA256" ]]; then
+        rm -f "$zip"
+        die "checksum mismatch for $(basename "$zip"): expected $SOURCE_SHA256, got $actual"
+      fi
+      ok "checksum verified (sha256 $actual)"
     fi
-    
-    # Verificar que Skia existe
-    verify_skia_version "$SKIA_VERSION" || {
-        log ERROR "La versión de Skia especificada no es válida."
-        exit 1
-    }
+    info "extracting"
+    unzip -q -o "$zip" -d "$SOURCE_DIR"
+  else
+    retry 3 5 git -c advice.detachedHead=false clone --quiet --depth 1 --recursive \
+      --shallow-submodules --branch "$ASEPRITE_VERSION" \
+      "https://github.com/$ASEPRITE_REPO.git" "$SOURCE_DIR" ||
+      die "unable to clone Aseprite $ASEPRITE_VERSION"
+  fi
+
+  [[ -f "$SOURCE_DIR/CMakeLists.txt" && -f "$SOURCE_DIR/laf/CMakeLists.txt" ]] ||
+    die "the Aseprite sources are incomplete"
+  touch "$marker"
+  ok "sources ready in $SOURCE_DIR"
+  endstep
 }
 
-# ----------------------------------------------------------------------------
-# VERIFICACIONES DEL SISTEMA
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Skia
+# ---------------------------------------------------------------------------
+skia_platform_name() {
+  case "$HOST_OS" in
+    linux) echo Linux ;;
+    macos) echo macOS ;;
+  esac
+}
 
-check_basic_dependencies() {
-    log INFO "Verificando dependencias básicas..."
-    
-    local deps=("curl" "grep" "sed")
-    local missing=()
-    
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then
-            missing+=("$dep")
-        fi
+setup_skia() {
+  step "Preparing Skia"
+  if [[ -z "$SKIA_TAG" ]]; then
+    local tag_file="$SOURCE_DIR/laf/misc/skia-tag.txt"
+    [[ -f "$tag_file" ]] || die "$tag_file not found; specify the Skia tag with --skia"
+    SKIA_TAG="$(tr -d '[:space:]' < "$tag_file")"
+  fi
+  [[ "$SKIA_TAG" =~ ^m[0-9]+-[0-9a-f]+$ ]] || die "invalid Skia tag: $SKIA_TAG"
+  info "tag      $SKIA_TAG"
+
+  SKIA_DIR="$WORK_DIR/deps/skia-$SKIA_TAG-$HOST_OS-$TARGET_ARCH"
+  SKIA_LIB_DIR="$SKIA_DIR/out/Release-$TARGET_ARCH"
+
+  if [[ -f "$SKIA_LIB_DIR/libskia.a" ]]; then
+    ok "reusing Skia in $SKIA_DIR"
+    endstep
+    return
+  fi
+
+  local package=""
+  if [[ "$SKIA_FROM_SOURCE" == "0" ]]; then
+    local json base candidate
+    json="$(github_api "repos/$SKIA_REPO/releases/tags/$SKIA_TAG" || true)"
+    base="Skia-$(skia_platform_name)-Release-$TARGET_ARCH"
+    for candidate in "$base.zip" "$base-libstdc++.zip"; do
+      if [[ -n "$json" ]] && printf '%s' "$json" | json_query '[a["name"] for a in d["assets"]]' |
+           grep -qxF "$candidate"; then
+        package="$candidate"
+        break
+      fi
     done
-    
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log WARN "Dependencias opcionales faltantes: ${missing[*]}"
-        log WARN "Algunas funcionalidades podrían no estar disponibles."
+  fi
+
+  if [[ -n "$package" ]]; then
+    info "package  $package (prebuilt)"
+    local zip="$WORK_DIR/downloads/skia-$SKIA_TAG-$package"
+    [[ -f "$zip" ]] || download "https://github.com/$SKIA_REPO/releases/download/$SKIA_TAG/$package" "$zip"
+    rm -rf "$SKIA_DIR"
+    mkdir -p "$SKIA_DIR"
+    if ! unzip -q -o "$zip" -d "$SKIA_DIR"; then
+      rm -f "$zip"
+      die "the Skia package is corrupt, run the script again to download it"
     fi
-    
-    log SUCCESS "Verificación de dependencias básicas completada."
+  else
+    info "no prebuilt package for $HOST_OS-$TARGET_ARCH, compiling Skia from source"
+    local -a args=(--tag "$SKIA_TAG" --arch "$TARGET_ARCH" --dest "$SKIA_DIR" --ninja "$(command -v ninja)")
+    if [[ -n "$JOBS" ]]; then args+=(--jobs "$JOBS"); fi
+    python3 "$SCRIPT_DIR/scripts/build-skia.py" "${args[@]}"
+  fi
+
+  [[ -f "$SKIA_LIB_DIR/libskia.a" ]] || die "libskia.a not found in $SKIA_LIB_DIR"
+  ok "Skia ready in $SKIA_DIR"
+  endstep
+}
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+default_jobs() {
+  local cpus mem jobs
+  cpus="$(cpu_count)"
+  mem="$(memory_gb)"
+  # Roughly 1.5 GB per compiler process keeps the build away from the OOM killer
+  jobs=$(( mem * 2 / 3 ))
+  (( jobs < 1 )) && jobs=1
+  (( jobs > cpus )) && jobs=$cpus
+  echo "$jobs"
 }
 
 check_disk_space() {
-    log INFO "Verificando espacio en disco..."
-    
-    local required_gb=15
-    local available_kb
-    available_kb=$(df "$SCRIPT_DIR" | awk 'NR==2 {print $4}')
-    local available_gb=$((available_kb / 1024 / 1024))
-    
-    if [[ $available_gb -lt $required_gb ]]; then
-        log WARN "Espacio disponible: ${available_gb}GB. Recomendado: ${required_gb}GB"
-        read -r -p "¿Deseas continuar de todos modos? (s/n): " confirm
-        if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
-            log INFO "Operación cancelada por el usuario."
-            exit 0
-        fi
-    else
-        log SUCCESS "Espacio en disco suficiente: ${available_gb}GB disponibles."
-    fi
+  local needed=6 available
+  [[ "$SKIA_FROM_SOURCE" == "1" || "$TARGET_ARCH" == arm64 && "$HOST_OS" == linux ]] && needed=12
+  available="$(free_disk_gb "$WORK_DIR")"
+  if (( available < needed )); then
+    warn "only ${available} GB free in $WORK_DIR, about ${needed} GB are recommended"
+    confirm "Continue anyway?" || die "aborted by user"
+  fi
 }
 
-prepare_directories() {
-    log INFO "Preparando directorios de salida..."
-    
-    if [[ -d "$OUTPUT_DIR" ]]; then
-        log DEBUG "Eliminando directorio de salida anterior..."
-        rm -rf "$OUTPUT_DIR"
-    fi
-    
-    mkdir -p "$OUTPUT_DIR"
-    
-    log SUCCESS "Directorios preparados: $OUTPUT_DIR"
-}
+configure_and_build() {
+  step "Configuring Aseprite"
+  local build_dir="$WORK_DIR/build/aseprite-$ASEPRITE_VERSION-$HOST_OS-$TARGET_ARCH"
+  if [[ "$FRESH_BUILD" == "1" ]]; then
+    rm -rf "$build_dir"
+  fi
+  mkdir -p "$build_dir"
 
-# ----------------------------------------------------------------------------
-# CONSTRUCCIÓN Y EXTRACCIÓN
-# ----------------------------------------------------------------------------
+  local -a cmake_args=(
+    -S "$SOURCE_DIR" -B "$build_dir" -G Ninja
+    -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+    -DLAF_BACKEND=skia
+    -DSKIA_DIR="$SKIA_DIR"
+    -DSKIA_LIBRARY_DIR="$SKIA_LIB_DIR"
+    -DSKIA_LIBRARY="$SKIA_LIB_DIR/libskia.a"
+    -DENABLE_TESTS=OFF
+    -DENABLE_CCACHE=OFF
+  )
+  # The source package is not a git checkout; without this the version
+  # string would be computed from `git describe` and come out empty.
+  if [[ -n "$SOURCE_URL" ]]; then
+    cmake_args+=(-DUPDATE_VERSION_WITH_GIT=OFF)
+  fi
 
-build_docker_image() {
-    log INFO "Construyendo imagen Docker..."
-    log INFO "Versión de Aseprite: ${ASEPRITE_VERSION}"
-    log INFO "Versión de Skia: ${SKIA_VERSION}"
-    log INFO "Timeout: ${BUILD_TIMEOUT}s"
-    log INFO "Este proceso puede tardar 15-45 minutos dependiendo de tu hardware..."
-    
-    local -a build_args=(
-        --build-arg "ASEPRITE_VERSION=${ASEPRITE_VERSION}"
-        --build-arg "SKIA_VERSION=${SKIA_VERSION}"
-        --target runtime
-        -t "$FULL_IMAGE_NAME"
-        -f "${SCRIPT_DIR}/Dockerfile"
-        "--progress=${DOCKER_PROGRESS}"
-        "$SCRIPT_DIR"
+  if [[ "$HOST_OS" == macos ]]; then
+    local osx_arch=arm64 min_version=11.0 sdk
+    if [[ "$TARGET_ARCH" == x64 ]]; then osx_arch=x86_64; min_version=10.15; fi
+    sdk="$(xcrun --sdk macosx --show-sdk-path)"
+    cmake_args+=(
+      -DCMAKE_OSX_ARCHITECTURES="$osx_arch"
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$min_version"
+      -DCMAKE_OSX_SYSROOT="$sdk"
     )
-    
-    echo ""
-    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}                    INICIANDO COMPILACIÓN                        ${NC}"
-    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    
-    local build_status=0
-    
-    if [[ "$USE_BUILDX" == "true" ]]; then
-        log DEBUG "Usando buildx build"
-        
-        # Construir comando completo para timeout
-        if command -v timeout &> /dev/null && [[ -n "$BUILD_TIMEOUT" ]]; then
-            if [[ "$NEED_SUDO" == "true" ]]; then
-                timeout "$BUILD_TIMEOUT" sudo docker buildx build --platform linux/amd64 "${build_args[@]}" || build_status=$?
-            else
-                timeout "$BUILD_TIMEOUT" docker buildx build --platform linux/amd64 "${build_args[@]}" || build_status=$?
-            fi
-        else
-            run_docker buildx build --platform linux/amd64 "${build_args[@]}" || build_status=$?
-        fi
-    else
-        log DEBUG "Usando build clásico"
-        
-        if command -v timeout &> /dev/null && [[ -n "$BUILD_TIMEOUT" ]]; then
-            if [[ "$NEED_SUDO" == "true" ]]; then
-                timeout "$BUILD_TIMEOUT" sudo docker build "${build_args[@]}" || build_status=$?
-            else
-                timeout "$BUILD_TIMEOUT" docker build "${build_args[@]}" || build_status=$?
-            fi
-        else
-            run_docker build "${build_args[@]}" || build_status=$?
-        fi
+    if [[ "$TARGET_ARCH" == arm64 ]]; then
+      cmake_args+=(-DPNG_ARM_NEON:STRING=on)
     fi
-    
-    # Verificar resultado
-    if [[ $build_status -eq 0 ]]; then
-        echo ""
-        log SUCCESS "Imagen Docker construida exitosamente."
-    elif [[ $build_status -eq 124 ]]; then
-        log ERROR "Timeout alcanzado (${BUILD_TIMEOUT}s). El build tardó demasiado."
-        log ERROR "Incrementa BUILD_TIMEOUT o verifica recursos del sistema."
-        exit 1
-    else
-        log ERROR "Error al construir la imagen Docker (código: $build_status)."
-        exit 1
+  else
+    if have clang && have clang++; then
+      cmake_args+=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++)
     fi
+    # Skia compiled with libc++ requires Aseprite to use libc++ as well
+    if grep -q -- '-stdlib=libc++' "$SKIA_LIB_DIR/args.gn" 2>/dev/null; then
+      cmake_args+=(-DCMAKE_CXX_FLAGS=-stdlib=libc++ -DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++)
+    fi
+  fi
+
+  debug "cmake ${cmake_args[*]}"
+  cmake "${cmake_args[@]}"
+  endstep
+
+  [[ -n "$JOBS" ]] || JOBS="$(default_jobs)"
+  step "Compiling Aseprite ($JOBS parallel jobs)"
+  local start=$SECONDS
+  ninja -C "$build_dir" -j "$JOBS" aseprite
+  ok "compiled in $(( (SECONDS - start) / 60 ))m $(( (SECONDS - start) % 60 ))s"
+  endstep
+
+  BUILD_BIN_DIR="$build_dir/bin"
 }
 
-# Aplicar permisos correctos a los archivos extraídos
-fix_permissions() {
-    local target_path="$1"
-    
-    log DEBUG "Aplicando permisos a: $target_path"
-    
-    if [[ "$NEED_SUDO" == "true" ]]; then
-        sudo chown -R "$USER:$USER" "$target_path"
-    fi
-    
-    # Asegurar que el binario sea ejecutable
-    if [[ -f "$target_path" && ! -d "$target_path" ]]; then
-        chmod +x "$target_path" 2>/dev/null || sudo chmod +x "$target_path"
-    fi
-}
+# ---------------------------------------------------------------------------
+# Packaging
+# ---------------------------------------------------------------------------
+write_notice() {
+  cat > "$1" <<EOF
+Aseprite $ASEPRITE_VERSION ($HOST_OS-$TARGET_ARCH)
+Built from https://github.com/$ASEPRITE_REPO on $(date -u '+%Y-%m-%d %H:%M UTC')
+Skia: $SKIA_TAG
+Build type: $BUILD_TYPE
 
-extract_files() {
-    log INFO "Extrayendo archivos del contenedor..."
-    
-    local container_id
-    
-    # Crear contenedor temporal
-    container_id=$(run_docker create --entrypoint="" "$FULL_IMAGE_NAME" /bin/true)
-    log DEBUG "Contenedor temporal creado: $container_id"
-    
-    cleanup_container() {
-        log DEBUG "Limpiando contenedor temporal..."
-        run_docker rm -f "$container_id" > /dev/null 2>&1 || true
-    }
-    
-    trap 'cleanup_container' ERR
-    
-    # Copiar binario
-    log INFO "Copiando binario de Aseprite..."
-    if run_docker cp "${container_id}:/usr/local/bin/aseprite" "${OUTPUT_DIR}/aseprite"; then
-        fix_permissions "${OUTPUT_DIR}/aseprite"
-        log SUCCESS "Binario copiado: ${OUTPUT_DIR}/aseprite"
-    else
-        log ERROR "Error al copiar el binario."
-        cleanup_container
-        exit 1
-    fi
-    
-    # Copiar datos/recursos
-    log INFO "Copiando recursos de Aseprite..."
-    if run_docker cp "${container_id}:/usr/local/share/aseprite/data" "${OUTPUT_DIR}/"; then
-        fix_permissions "${OUTPUT_DIR}/data"
-        log SUCCESS "Recursos copiados: ${OUTPUT_DIR}/data"
-    else
-        log ERROR "Error al copiar los recursos."
-        cleanup_container
-        exit 1
-    fi
-    
-    cleanup_container
-    trap - ERR
-    
-    log SUCCESS "Extracción completada."
-}
-
-verify_files() {
-    log INFO "Verificando archivos extraídos..."
-    
-    local errors=0
-    
-    if [[ -f "${OUTPUT_DIR}/aseprite" ]]; then
-        local size
-        size=$(du -h "${OUTPUT_DIR}/aseprite" | cut -f1)
-        log SUCCESS "Binario encontrado: ${OUTPUT_DIR}/aseprite ($size)"
-        
-        if [[ -x "${OUTPUT_DIR}/aseprite" ]]; then
-            log SUCCESS "El binario tiene permisos de ejecución."
-        else
-            log WARN "El binario no tiene permisos de ejecución. Añadiendo..."
-            chmod +x "${OUTPUT_DIR}/aseprite" 2>/dev/null || sudo chmod +x "${OUTPUT_DIR}/aseprite"
-        fi
-    else
-        log ERROR "Binario no encontrado: ${OUTPUT_DIR}/aseprite"
-        ((errors++))
-    fi
-    
-    if [[ -d "${OUTPUT_DIR}/data" ]]; then
-        local file_count
-        file_count=$(find "${OUTPUT_DIR}/data" -type f | wc -l)
-        log SUCCESS "Recursos encontrados: ${OUTPUT_DIR}/data ($file_count archivos)"
-    else
-        log ERROR "Recursos no encontrados: ${OUTPUT_DIR}/data"
-        ((errors++))
-    fi
-    
-    if [[ $errors -gt 0 ]]; then
-        log ERROR "Verificación fallida con $errors errores."
-        exit 1
-    fi
-    
-    log SUCCESS "Verificación completada exitosamente."
-}
-
-generate_run_script() {
-    log INFO "Generando script de ejecución..."
-    
-    local run_script="${OUTPUT_DIR}/run-aseprite.sh"
-    
-    cat > "$run_script" << 'SCRIPT'
-#!/usr/bin/env bash
-# Script para ejecutar Aseprite
-# Generado automáticamente
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ASEPRITE_BIN="${SCRIPT_DIR}/aseprite"
-
-if [[ ! -f "$ASEPRITE_BIN" ]]; then
-    echo "Error: No se encontró el binario de Aseprite en: $ASEPRITE_BIN"
-    exit 1
-fi
-
-if [[ ! -d "${SCRIPT_DIR}/data" ]]; then
-    echo "Advertencia: No se encontró la carpeta data en: ${SCRIPT_DIR}/data"
-fi
-
-# Ejecutar desde el directorio donde está el binario
-cd "$SCRIPT_DIR"
-exec "./aseprite" "$@"
-SCRIPT
-    
-    chmod +x "$run_script"
-    log SUCCESS "Script de ejecución generado: $run_script"
-}
-
-generate_version_info() {
-    log INFO "Generando archivo de información de versión..."
-    
-    local info_file="${OUTPUT_DIR}/version-info.txt"
-    
-    cat > "$info_file" << EOF
-Aseprite Build Information
-===========================
-Fecha de compilación: $(date '+%Y-%m-%d %H:%M:%S')
-Aseprite Version: ${ASEPRITE_VERSION}
-Skia Version: ${SKIA_VERSION}
-Sistema: $(uname -s) $(uname -m)
-Docker Image: ${FULL_IMAGE_NAME}
+This build is covered by the Aseprite End-User License Agreement
+(EULA.txt). It may only be used for personal purposes and must not be
+redistributed. To support the developers, buy Aseprite at
+https://www.aseprite.org/
 EOF
-    
-    log SUCCESS "Información de versión: $info_file"
 }
 
-show_summary() {
-    echo ""
-    echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║                    COMPILACIÓN EXITOSA                        ║${NC}"
-    echo -e "${GREEN}╠═══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${GREEN}║  Aseprite: $(printf '%-49s' "$ASEPRITE_VERSION")║${NC}"
-    echo -e "${GREEN}║  Skia:     $(printf '%-49s' "$SKIA_VERSION")║${NC}"
-    echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo -e "${WHITE}Archivos generados:${NC}"
-    echo -e "  ${CYAN}➜${NC} Binario:   ${OUTPUT_DIR}/aseprite"
-    echo -e "  ${CYAN}➜${NC} Recursos:  ${OUTPUT_DIR}/data/"
-    echo -e "  ${CYAN}➜${NC} Ejecutar:  ${OUTPUT_DIR}/run-aseprite.sh"
-    echo ""
-    echo -e "${WHITE}Estructura:${NC}"
-    echo -e "  ${OUTPUT_DIR}/"
-    echo -e "  ├── aseprite"
-    echo -e "  ├── data/"
-    echo -e "  ├── run-aseprite.sh"
-    echo -e "  └── version-info.txt"
-    echo ""
-    echo -e "${WHITE}Para ejecutar Aseprite:${NC}"
-    echo -e "  ${YELLOW}${OUTPUT_DIR}/run-aseprite.sh${NC}"
-    echo ""
-    echo -e "${WHITE}O directamente:${NC}"
-    echo -e "  ${YELLOW}cd ${OUTPUT_DIR} && ./aseprite${NC}"
-    echo ""
-}
-
-cleanup_docker() {
-    if [[ "$SKIP_CLEANUP" == "true" ]]; then
-        log INFO "Limpieza automática desactivada (--skip-cleanup)."
-        return
-    fi
-    
-    echo ""
-    read -r -p "¿Deseas eliminar la imagen Docker '${FULL_IMAGE_NAME}'? (s/n): " confirm
-    
-    if [[ "$confirm" =~ ^[Ss]$ ]]; then
-        log INFO "Eliminando imagen Docker..."
-        
-        if run_docker rmi "$FULL_IMAGE_NAME" > /dev/null 2>&1; then
-            log SUCCESS "Imagen eliminada: $FULL_IMAGE_NAME"
-        else
-            log WARN "No se pudo eliminar la imagen."
-        fi
-        
-        log INFO "Limpiando imágenes huérfanas..."
-        run_docker image prune -f > /dev/null 2>&1 || true
+make_icns() {
+  # make_icns PREFIX OUTPUT: builds an .icns from data/icons/<prefix><size>.png
+  local prefix=$1 output=$2 icons="$SOURCE_DIR/data/icons" iconset
+  have iconutil && have sips || return 0
+  [[ -f "$icons/${prefix}256.png" ]] || return 0
+  iconset="$(mktemp -d)/icon.iconset"
+  mkdir -p "$iconset"
+  local size
+  for size in 16 32 128 256; do
+    if [[ -f "$icons/$prefix$size.png" ]]; then
+      cp "$icons/$prefix$size.png" "$iconset/icon_${size}x${size}.png"
     else
-        log INFO "Imagen conservada: $FULL_IMAGE_NAME"
+      sips -z "$size" "$size" "$icons/${prefix}256.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
     fi
+    sips -z $((size * 2)) $((size * 2)) "$icons/${prefix}256.png" \
+      --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$iconset" -o "$output" || warn "unable to create $(basename "$output")"
+  rm -rf "$(dirname "$iconset")"
 }
 
-full_cleanup() {
-    log WARN "Realizando limpieza completa..."
-    
-    check_docker_permissions
-    
-    local containers
-    containers=$(run_docker ps -a -q --filter "ancestor=$FULL_IMAGE_NAME" 2>/dev/null || true)
-    if [[ -n "$containers" ]]; then
-        log INFO "Eliminando contenedores..."
-        echo "$containers" | xargs -r run_docker rm -f > /dev/null 2>&1 || true
-    fi
-    
-    if run_docker image inspect "$FULL_IMAGE_NAME" > /dev/null 2>&1; then
-        log INFO "Eliminando imagen..."
-        run_docker rmi -f "$FULL_IMAGE_NAME" > /dev/null 2>&1 || true
-    fi
-    
-    if [[ -d "$OUTPUT_DIR" ]]; then
-        log INFO "Eliminando directorio de salida..."
-        rm -rf "$OUTPUT_DIR"
-    fi
-    
-    log INFO "Limpiando imágenes huérfanas..."
-    run_docker image prune -f > /dev/null 2>&1 || true
-    
-    log SUCCESS "Limpieza completa finalizada."
+package_linux() {
+  local dest=$1
+  cp "$BUILD_BIN_DIR/aseprite" "$dest/"
+  cp -R "$BUILD_BIN_DIR/data" "$dest/"
+  if [[ -f "$BUILD_BIN_DIR/icudtl.dat" ]]; then cp "$BUILD_BIN_DIR/icudtl.dat" "$dest/"; fi
+  strip "$dest/aseprite" 2>/dev/null || true
+
+  sed -e "s|^Exec=.*|Exec=aseprite %U|" "$SOURCE_DIR/src/desktop/linux/aseprite.desktop" \
+    > "$dest/aseprite.desktop" 2>/dev/null || true
+  if [[ -f "$SOURCE_DIR/data/icons/ase256.png" ]]; then
+    cp "$SOURCE_DIR/data/icons/ase256.png" "$dest/aseprite.png"
+  fi
+
+  cat > "$dest/install.sh" <<'EOF'
+#!/usr/bin/env bash
+# Installs this Aseprite build for the current user (~/.local).
+set -euo pipefail
+src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+prefix="${PREFIX:-$HOME/.local}"
+mkdir -p "$prefix/opt" "$prefix/bin" "$prefix/share/applications" "$prefix/share/icons/hicolor/256x256/apps"
+rm -rf "$prefix/opt/aseprite"
+cp -R "$src" "$prefix/opt/aseprite"
+ln -sf "$prefix/opt/aseprite/aseprite" "$prefix/bin/aseprite"
+if [[ -f "$src/aseprite.desktop" ]]; then
+  sed "s|^Exec=.*|Exec=$prefix/opt/aseprite/aseprite %U|" "$src/aseprite.desktop" \
+    > "$prefix/share/applications/aseprite.desktop"
+fi
+[[ -f "$src/aseprite.png" ]] && cp "$src/aseprite.png" "$prefix/share/icons/hicolor/256x256/apps/aseprite.png"
+command -v update-desktop-database >/dev/null && update-desktop-database "$prefix/share/applications" || true
+echo "Aseprite installed in $prefix/opt/aseprite"
+echo "Make sure $prefix/bin is in your PATH."
+EOF
+  chmod +x "$dest/install.sh" "$dest/aseprite"
 }
 
-# ----------------------------------------------------------------------------
-# PROCESAMIENTO DE ARGUMENTOS
-# ----------------------------------------------------------------------------
-
-parse_arguments() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -h|--help)
-                show_usage
-                exit 0
-                ;;
-            -v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            -V|--version)
-                if [[ -n "${2:-}" ]]; then
-                    ASEPRITE_VERSION="$2"
-                    shift 2
-                else
-                    log ERROR "La opción --version requiere un argumento."
-                    exit 1
-                fi
-                ;;
-            -S|--skia)
-                if [[ -n "${2:-}" ]]; then
-                    SKIA_VERSION="$2"
-                    shift 2
-                else
-                    log ERROR "La opción --skia requiere un argumento."
-                    exit 1
-                fi
-                ;;
-            -s|--skip-cleanup)
-                SKIP_CLEANUP=true
-                shift
-                ;;
-            -c|--clean)
-                full_cleanup
-                exit 0
-                ;;
-            -l|--list-versions)
-                list_versions
-                exit 0
-                ;;
-            -t|--timeout)
-                if [[ -n "${2:-}" ]]; then
-                    BUILD_TIMEOUT="$2"
-                    shift 2
-                else
-                    log ERROR "La opción --timeout requiere un argumento."
-                    exit 1
-                fi
-                ;;
-            *)
-                log ERROR "Opción desconocida: $1"
-                show_usage
-                exit 1
-                ;;
-        esac
-    done
+package_macos() {
+  local dest=$1 app="$1/Aseprite.app"
+  [[ -d "$BUILD_BIN_DIR/Aseprite.app" ]] || die "Aseprite.app was not produced"
+  # -L resolves symlinks so the bundle is self-contained
+  cp -RL "$BUILD_BIN_DIR/Aseprite.app" "$dest/"
+  if [[ -f "$BUILD_BIN_DIR/icudtl.dat" && ! -f "$app/Contents/MacOS/icudtl.dat" ]]; then
+    cp "$BUILD_BIN_DIR/icudtl.dat" "$app/Contents/MacOS/"
+  fi
+  make_icns ase "$app/Contents/Resources/Aseprite.icns"
+  make_icns doc "$app/Contents/Resources/Document.icns"
+  strip -x "$app/Contents/MacOS/aseprite" 2>/dev/null || true
+  xattr -cr "$app" 2>/dev/null || true
+  # Apple Silicon refuses to run unsigned binaries; an ad-hoc signature is enough
+  codesign --force --deep --sign - "$app" || warn "ad-hoc code signing failed"
 }
 
-# ----------------------------------------------------------------------------
-# FUNCIÓN PRINCIPAL
-# ----------------------------------------------------------------------------
+create_dmg() {
+  local src=$1 dmg=$2 staging
+  staging="$(mktemp -d)"
+  cp -R "$src/Aseprite.app" "$staging/"
+  cp "$src/BUILD-INFO.txt" "$src/EULA.txt" "$staging/" 2>/dev/null || true
+  ln -s /Applications "$staging/Applications"
+  local status=0
+  retry 3 5 hdiutil create -quiet -volname "Aseprite $VERSION_NUMBER" -srcfolder "$staging" \
+    -fs HFS+ -format UDZO -ov "$dmg" || status=1
+  rm -rf "$staging"
+  return $status
+}
 
+package() {
+  step "Packaging"
+  PACKAGE_NAME="aseprite-$ASEPRITE_VERSION-$HOST_OS-$TARGET_ARCH"
+  local dest="$OUTPUT_DIR/$PACKAGE_NAME"
+  rm -rf "$dest"
+  mkdir -p "$dest"
+
+  if [[ "$HOST_OS" == macos ]]; then package_macos "$dest"; else package_linux "$dest"; fi
+  cp "$SOURCE_DIR/EULA.txt" "$dest/EULA.txt"
+  write_notice "$dest/BUILD-INFO.txt"
+  ok "application: $dest"
+
+  if [[ "$CREATE_ARCHIVE" == "1" ]]; then
+    local archive
+    if [[ "$HOST_OS" == macos ]]; then
+      archive="$OUTPUT_DIR/$PACKAGE_NAME.dmg"
+      if ! create_dmg "$dest" "$archive"; then
+        warn "unable to create a disk image, creating a zip archive instead"
+        archive="$OUTPUT_DIR/$PACKAGE_NAME.zip"
+        (cd "$OUTPUT_DIR" && ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_NAME" "$archive")
+      fi
+    else
+      archive="$OUTPUT_DIR/$PACKAGE_NAME.tar.gz"
+      tar -C "$OUTPUT_DIR" -czf "$archive" "$PACKAGE_NAME"
+    fi
+    (cd "$OUTPUT_DIR" && printf '%s  %s\n' "$(sha256_of "$archive")" "$(basename "$archive")" \
+      > "$(basename "$archive").sha256")
+    ok "archive:     $archive"
+  fi
+  endstep
+}
+
+# ---------------------------------------------------------------------------
+# Docker mode
+# ---------------------------------------------------------------------------
+build_in_docker() {
+  have docker || die "Docker is not installed: https://docs.docker.com/get-docker/"
+  local -a docker=(docker)
+  if ! docker info >/dev/null 2>&1; then
+    if have sudo && sudo -n true 2>/dev/null && sudo docker info >/dev/null 2>&1; then
+      docker=(sudo docker)
+    elif have sudo; then
+      warn "Docker requires elevated privileges; you may be asked for your password"
+      warn "add your user to the docker group to avoid this: sudo usermod -aG docker \$USER"
+      sudo docker info >/dev/null 2>&1 || die "unable to connect to the Docker daemon"
+      docker=(sudo docker)
+    else
+      die "unable to connect to the Docker daemon (is it running?)"
+    fi
+  fi
+
+  local platform="linux/amd64"
+  [[ "$TARGET_ARCH" == arm64 ]] && platform="linux/arm64"
+  if [[ "$TARGET_ARCH" != "$HOST_ARCH" ]]; then
+    warn "building for $TARGET_ARCH on a $HOST_ARCH machine uses emulation and can take several hours"
+    confirm "Continue?" || die "aborted by user"
+  fi
+
+  step "Building Aseprite $ASEPRITE_VERSION in Docker ($platform)"
+  local -a args=(
+    --platform "$platform"
+    --file "$SCRIPT_DIR/Dockerfile"
+    --target export
+    --output "type=local,dest=$OUTPUT_DIR"
+    --build-arg "ASEPRITE_VERSION=$ASEPRITE_VERSION"
+    --build-arg "BUILD_TYPE=$BUILD_TYPE"
+    --build-arg "SKIA_TAG=$SKIA_TAG"
+    --build-arg "SKIA_FROM_SOURCE=$SKIA_FROM_SOURCE"
+    --build-arg "JOBS=$JOBS"
+    --progress plain
+  )
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    args+=(--secret "id=github_token,env=GITHUB_TOKEN")
+  fi
+
+  if "${docker[@]}" buildx version >/dev/null 2>&1; then
+    "${docker[@]}" buildx build "${args[@]}" "$SCRIPT_DIR"
+  else
+    DOCKER_BUILDKIT=1 "${docker[@]}" build "${args[@]}" "$SCRIPT_DIR"
+  fi
+  endstep
+  PACKAGE_NAME="aseprite-$ASEPRITE_VERSION-linux-$TARGET_ARCH"
+  [[ -d "$OUTPUT_DIR/$PACKAGE_NAME" ]] || die "the Docker build did not produce $PACKAGE_NAME"
+  if [[ "$(id -u)" != "0" && "${docker[0]}" == sudo ]]; then
+    sudo chown -R "$(id -u):$(id -g)" "$OUTPUT_DIR"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Maintenance
+# ---------------------------------------------------------------------------
+clean_all() {
+  info "this removes $WORK_DIR and $OUTPUT_DIR"
+  confirm "Delete them?" || die "aborted by user"
+  rm -rf "$WORK_DIR" "$OUTPUT_DIR"
+  ok "clean"
+}
+
+summary() {
+  printf '\n%sBuild completed%s\n' "$C_GREEN$C_BOLD" "$C_RESET"
+  printf '  Version   %s\n' "$ASEPRITE_VERSION"
+  printf '  Target    %s-%s\n' "${HOST_OS/macos/macos}" "$TARGET_ARCH"
+  printf '  Output    %s\n' "$OUTPUT_DIR/$PACKAGE_NAME"
+  if [[ "$HOST_OS" == macos && "$USE_DOCKER" == "0" ]]; then
+    printf '  Run       open "%s/Aseprite.app"\n' "$OUTPUT_DIR/$PACKAGE_NAME"
+  else
+    printf '  Run       "%s/aseprite"\n' "$OUTPUT_DIR/$PACKAGE_NAME"
+  fi
+  printf '\n%sPersonal use only. Redistribution is prohibited by the Aseprite EULA.%s\n' "$C_DIM" "$C_RESET"
+  if in_ci && [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    {
+      echo "version=$ASEPRITE_VERSION"
+      echo "package=$PACKAGE_NAME"
+      echo "output_dir=$OUTPUT_DIR"
+    } >> "$GITHUB_OUTPUT"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 main() {
-    parse_arguments "$@"
-    
-    print_banner
-    
-    # Verificaciones iniciales
-    check_architecture
-    check_basic_dependencies
-    check_docker_permissions
-    check_docker_running
-    check_docker_buildx
-    
-    # Configurar versiones
-    setup_versions
-    
-    # Mostrar configuración
-    echo ""
-    log INFO "Configuración final:"
-    log INFO "  - Aseprite: $ASEPRITE_VERSION"
-    log INFO "  - Skia: $SKIA_VERSION"
-    log INFO "  - Directorio salida: $OUTPUT_DIR"
-    log INFO "  - Usando sudo: $NEED_SUDO"
-    log INFO "  - Usando buildx: $USE_BUILDX"
-    log INFO "  - Timeout: ${BUILD_TIMEOUT}s"
-    log INFO "  - Verbose: $VERBOSE"
-    echo ""
-    
-    # Ejecutar pasos de compilación
-    check_disk_space
-    prepare_directories
-    build_docker_image
-    extract_files
-    verify_files
-    generate_run_script
-    generate_version_info
-    show_summary
-    cleanup_docker
-    
-    log SUCCESS "¡Proceso completado exitosamente!"
+  parse_args "$@"
+  detect_platform
+
+  printf '%sAseprite build script %s%s  (%s-%s -> %s)\n' \
+    "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET" "$HOST_OS" "$HOST_ARCH" "$TARGET_ARCH"
+
+  if [[ "$USE_DOCKER" == "1" ]]; then
+    have curl || die "curl is required"
+    have python3 || die "python3 is required"
+    resolve_version
+    build_in_docker
+    HOST_OS=linux
+    summary
+    return
+  fi
+
+  if [[ "$INSTALL_DEPS" == "1" ]]; then install_dependencies; fi
+  check_dependencies
+  resolve_version
+  check_disk_space
+  fetch_sources
+  setup_skia
+  configure_and_build
+  package
+  summary
 }
 
-# ----------------------------------------------------------------------------
-# PUNTO DE ENTRADA
-# ----------------------------------------------------------------------------
 main "$@"
